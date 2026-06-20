@@ -1,99 +1,110 @@
-import fitz  # PyMuPDF
-from docx import Document
 import email
-import os
 import logging
-import requests
+import os
 import tempfile
 
-logging.basicConfig(level=logging.INFO)
+import fitz
+import requests
+from docx import Document
+
+logger = logging.getLogger(__name__)
+
+SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".eml"}
+
 
 def download_file(url: str) -> str:
-    """Download remote file into a temp path and return the local path."""
     try:
-        response = requests.get(url)
+        response = requests.get(url, timeout=60)
         response.raise_for_status()
 
-        suffix = os.path.splitext(url)[-1].split("?")[0]  # handles ? in URL
-        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-        tmp_file.write(response.content)
-        tmp_file.close()
+        suffix = os.path.splitext(url.split("?", 1)[0])[-1].lower()
+        if suffix not in SUPPORTED_EXTENSIONS:
+            raise ValueError(f"Unsupported file type: {suffix or '<none>'}")
 
-        logging.info(f"Downloaded file to temp: {tmp_file.name}")
-        return tmp_file.name
-    except Exception as e:
-        logging.error(f"Error downloading file: {e}")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
+            tmp_file.write(response.content)
+            temp_path = tmp_file.name
+
+        logger.info("Downloaded remote document to temporary file")
+        return temp_path
+    except Exception:
+        logger.exception("Error downloading remote document")
         raise
 
+
 def clean_text(text: str) -> str:
-    """Basic cleanup: strip blank lines; drop lines starting with 'page'."""
     lines = text.splitlines()
-    filtered = [line.strip() for line in lines if line.strip() and not line.lower().startswith("page")]
+    filtered = [
+        line.strip()
+        for line in lines
+        if line.strip() and not line.lower().startswith("page")
+    ]
     return "\n".join(filtered)
 
+
 def extract_text_from_pdf(file_path: str) -> str:
-    """Extract plain text from PDF using PyMuPDF, concatenating page text."""
     try:
         texts = []
         with fitz.open(file_path) as doc:
             for page in doc:
                 texts.append(page.get_text("text"))
         return clean_text("\n".join(texts)).strip()
-    except Exception as e:
-        logging.error(f"Error extracting PDF text: {e}")
+    except Exception:
+        logger.exception("Error extracting PDF text")
         raise
+
 
 def extract_text_from_docx(file_path: str) -> str:
     try:
         doc = Document(file_path)
-        return clean_text("\n".join([para.text for para in doc.paragraphs])).strip()
-    except Exception as e:
-        logging.error(f"Error extracting DOCX text: {e}")
+        return clean_text("\n".join(para.text for para in doc.paragraphs)).strip()
+    except Exception:
+        logger.exception("Error extracting DOCX text")
         raise
+
 
 def extract_text_from_email(file_path: str) -> str:
     try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            msg = email.message_from_file(f)
+        with open(file_path, "r", encoding="utf-8") as file:
+            message = email.message_from_file(file)
 
         parts = []
-        for part in msg.walk():
+        for part in message.walk():
             if part.get_content_type() == "text/plain":
-                try:
-                    parts.append(part.get_payload(decode=True).decode(errors="ignore"))
-                except Exception:
-                    parts.append(part.get_payload())
+                payload = part.get_payload(decode=True)
+                if isinstance(payload, bytes):
+                    parts.append(payload.decode(errors="ignore"))
+                else:
+                    parts.append(str(part.get_payload()))
 
         return clean_text("\n".join(parts)).strip()
-    except Exception as e:
-        logging.error(f"Error extracting email text: {e}")
+    except Exception:
+        logger.exception("Error extracting email text")
         raise
 
+
 def extract_text(file_path_or_url: str) -> str:
-    """
-    Router: accepts a local path or URL; returns cleaned plain text.
-    """
-    # URL → download to temp
+    temp_path = None
     if file_path_or_url.startswith(("http://", "https://")):
         file_path = download_file(file_path_or_url)
+        temp_path = file_path
     else:
         file_path = file_path_or_url
 
-    ext = os.path.splitext(file_path)[1].lower()
-    logging.info(f"Extracting text from: {file_path} (type: {ext})")
+    try:
+        extension = os.path.splitext(file_path)[1].lower()
+        logger.info("Extracting document text with extension=%s", extension)
 
-    if ext == ".pdf":
-        return extract_text_from_pdf(file_path)
-    elif ext == ".docx":
-        return extract_text_from_docx(file_path)
-    elif ext == ".eml":
-        return extract_text_from_email(file_path)
-    else:
-        raise ValueError(f"Unsupported file type: {ext}")
-
-# Quick local test
-if __name__ == "__main__":
-    sample_url = "https://hackrx.blob.core.windows.net/assets/policy.pdf?sv=2023-01-03&st=2025-07-04T09%3A11%3A24Z&se=2027-07-05T09%3A11%3A00Z&sr=b&sp=r&sig=N4a9OU0w0QXO6AOIBiu4bpl7AXvEZogeT%2FjUHNO7HzQ%3D"
-    result = extract_text(sample_url)
-    print("\n--- Extracted Text (first 2000 chars) ---\n")
-    print(result[:2000])
+        if extension == ".pdf":
+            return extract_text_from_pdf(file_path)
+        if extension == ".docx":
+            return extract_text_from_docx(file_path)
+        if extension == ".eml":
+            return extract_text_from_email(file_path)
+        raise ValueError(f"Unsupported file type: {extension}")
+    finally:
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                logger.warning("Unable to delete temporary document file")

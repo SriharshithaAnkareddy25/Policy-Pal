@@ -45,3 +45,6 @@ coverage.xml
 dist/
 build/
 *.egg-info/
+
+# Duplicate legacy project tree; root main.py/backend/ml is canonical.
+PolicyPal/

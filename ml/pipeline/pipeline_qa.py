@@ -1,11 +1,46 @@
 import hashlib
 import json
-from typing import List
+import logging
+import re
+from typing import Any, List
 
-from backend.services.retrieval import semantic_search  # your retrieval
-from ml.model.gemini_client import call_gemini_llm  # ✅ changed to Gemini
-from ml.pipeline.prompt_builder import build_llm_prompt  # prompt builder
-from backend.services.qa import answer_one_question  # heuristic fallback
+from backend.services.retrieval import semantic_search
+from ml.model.gemini_client import call_gemini_llm
+from ml.pipeline.prompt_builder import build_llm_prompt
+
+logger = logging.getLogger(__name__)
+
+
+def _response_text(raw_response: Any) -> str:
+    if isinstance(raw_response, dict):
+        return (
+            raw_response.get("candidates", [{}])[0]
+            .get("content", {})
+            .get("parts", [{}])[0]
+            .get("text", "")
+        )
+    return str(raw_response or "")
+
+
+def extract_json_payload(raw_response: Any) -> dict:
+    text = _response_text(raw_response).strip()
+    if not text:
+        raise ValueError("LLM response was empty")
+
+    fenced_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL)
+    if fenced_match:
+        text = fenced_match.group(1)
+    elif not text.startswith("{"):
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise ValueError("No JSON object found in LLM response")
+        text = text[start : end + 1]
+
+    parsed = json.loads(text)
+    if not isinstance(parsed, dict):
+        raise ValueError("LLM JSON response must be an object")
+    return parsed
 
 
 def answer_questions(
@@ -13,73 +48,32 @@ def answer_questions(
     questions: List[str],
     top_k: int = 8,
 ) -> List[str]:
-    """
-    Full question-answer pipeline: retrieval + LLM + fallback.
-    Returns a list of answers aligned with `questions`.
-    """
-    source_id = hashlib.md5(document_url.encode()).hexdigest()
-    namespace = source_id  # you used namespace-per-document in upsert
+    source_id = hashlib.md5(document_url.encode("utf-8")).hexdigest()
 
-    # 1. Retrieve shared context for all questions (shared chunks)
     combined_query = " ".join(questions)
     context_chunks = semantic_search(
         combined_query,
         top_k=top_k,
-        namespace=namespace,
+        namespace=source_id,
         fltr={"source": {"$eq": source_id}},
     )
 
-    # 2. Build prompt for Gemini
     prompt = build_llm_prompt(context_chunks, questions)
 
-    # 3. Call Gemini LLM
     try:
         raw_response = call_gemini_llm(prompt)
-    except Exception:
-        # Gemini call failed: fallback to heuristics
-        return [
-            answer_one_question(
-                q,
-                semantic_search(
-                    q,
-                    top_k=top_k,
-                    namespace=namespace,
-                    fltr={"source": {"$eq": source_id}},
-                ),
-            )
-            for q in questions
-        ]
-
-    # 4. Attempt to parse the JSON from Gemini
-    try:
-        # In case Gemini wraps response inside 'candidates[0].content.parts[0].text' format
-        if isinstance(raw_response, dict):
-            text = (
-                raw_response.get("candidates", [{}])[0]
-                .get("content", {})
-                .get("parts", [{}])[0]
-                .get("text", "")
-            )
-        else:
-            text = raw_response
-
-        parsed = json.loads(text.strip())
+        parsed = extract_json_payload(raw_response)
         answers = parsed.get("answers")
-
-        if isinstance(answers, list) and len(answers) == len(questions):
-            return answers
-    except (json.JSONDecodeError, KeyError, IndexError, TypeError):
-        pass  # fallback
-
-    # 5. Fallback if JSON was invalid or misaligned
-    fallback_answers = []
-    for q in questions:
-        retrieved = semantic_search(
-            q,
-            top_k=top_k,
-            namespace=namespace,
-            fltr={"source": {"$eq": source_id}},
-        )
-        fallback_answers.append(answer_one_question(q, retrieved))
-
-    return fallback_answers
+        if not isinstance(answers, list):
+            raise ValueError("LLM response is missing an answers list")
+        if len(answers) != len(questions):
+            raise ValueError(
+                f"LLM returned {len(answers)} answer(s) for {len(questions)} question(s)"
+            )
+        return [str(answer).strip() for answer in answers]
+    except Exception as exc:
+        logger.exception("Gemini answer generation failed")
+        raise RuntimeError(
+            "Gemini could not generate an answer. Check GEMINI_API_KEY and "
+            "GEMINI_MODEL, then retry."
+        ) from exc

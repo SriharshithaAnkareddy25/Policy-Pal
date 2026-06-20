@@ -1,150 +1,162 @@
-import os
 import hashlib
-import time
 import logging
-from typing import List
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
-from dotenv import load_dotenv
-from pinecone import Pinecone, PodSpec, ServerlessSpec
-from pinecone.exceptions import PineconeApiException
-from backend.services.embedding import get_embedding  # Gemini embedder
-from backend.services.text_chunker import chunk_text
-from backend.app.document_parser import extract_text
+import os
+import sys
+import time
+from typing import Any, List, Optional
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from dotenv import load_dotenv
+
+from backend.app.document_parser import extract_text
+from backend.services.embedding import get_embedding
+from backend.services.text_chunker import chunk_text
 
 load_dotenv()
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-if not PINECONE_API_KEY:
-    raise ValueError("❌ PINECONE_API_KEY not found in .env file")
 
-# Configurable via env: "pod" or "serverless"
+logger = logging.getLogger(__name__)
+
+INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "policy-embeddings")
 DEPLOY_TYPE = os.getenv("PINECONE_DEPLOY_TYPE", "serverless").lower()
-INDEX_NAME = "policy-embeddings"
-REGION = "us-east-1"
-BATCH_SIZE = 100
+REGION = os.getenv("PINECONE_REGION", "us-east-1")
+BATCH_SIZE = int(os.getenv("PINECONE_BATCH_SIZE", "100"))
 
-pc = Pinecone(api_key=PINECONE_API_KEY)
+_pc: Optional[Any] = None
+_index: Optional[Any] = None
+_dimension: Optional[int] = None
+
+
+def _index_names(indexes: Any) -> list[str]:
+    if hasattr(indexes, "names"):
+        return list(indexes.names())
+    names = []
+    for item in indexes:
+        if isinstance(item, str):
+            names.append(item)
+        elif isinstance(item, dict):
+            names.append(item.get("name", ""))
+        else:
+            names.append(getattr(item, "name", ""))
+    return [name for name in names if name]
+
+
+def get_pinecone_client() -> Any:
+    global _pc
+    if _pc is None:
+        api_key = os.getenv("PINECONE_API_KEY")
+        if not api_key:
+            raise RuntimeError("Missing PINECONE_API_KEY in environment")
+        try:
+            from pinecone import Pinecone
+        except ImportError as exc:
+            raise RuntimeError(
+                "The Pinecone SDK loaded by "
+                f"'{sys.executable}' does not expose Pinecone. Remove conflicting "
+                "packages and reinstall with this interpreter: "
+                f"'{sys.executable}' -m pip uninstall -y pinecone pinecone-client; "
+                f"'{sys.executable}' -m pip install -r requirements.txt"
+            ) from exc
+        _pc = Pinecone(api_key=api_key)
+    return _pc
 
 
 def _make_spec():
     if DEPLOY_TYPE == "pod":
-        # Replace "starter" with your accessible pod name if different (e.g., "s1")
-        return PodSpec(name="starter", environment=REGION)
-    else:
-        return ServerlessSpec(cloud="aws", region=REGION)
+        from pinecone import PodSpec
+
+        return PodSpec(name=os.getenv("PINECONE_POD_TYPE", "starter"), environment=REGION)
+    from pinecone import ServerlessSpec
+
+    return ServerlessSpec(cloud=os.getenv("PINECONE_CLOUD", "aws"), region=REGION)
 
 
-def _wait_for_index_deletion(name: str, timeout: int = 10):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if name not in pc.list_indexes():
-            return
-        time.sleep(0.5)
-    logger.warning("Timeout waiting for index %s to disappear after deletion.", name)
+def _describe_dimension(client: Any, index_name: str) -> Optional[int]:
+    description = client.describe_index(index_name)
+    if isinstance(description, dict):
+        return description.get("dimension")
+    return getattr(description, "dimension", None)
 
 
-def _detect_embedding_dimension(sample_text: str = "dimension check", timeout_sec: float = 5.0) -> int:
-    """
-    Attempts to get a single embedding to determine its dimension, with a timeout.
-    Falls back to a conservative default if detection fails.
-    """
-    default = 1536  # reasonable fallback for many Gemini embedding variants
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(get_embedding, sample_text)
+def get_embedding_dimension(sample_text: str = "dimension check") -> int:
+    global _dimension
+    if _dimension is None:
+        embedding = get_embedding(sample_text)
+        if not isinstance(embedding, list) or not embedding:
+            raise RuntimeError("Embedding provider returned an invalid vector")
+        _dimension = len(embedding)
+        logger.info("Detected embedding dimension: %s", _dimension)
+    return _dimension
+
+
+def ensure_index(dimension: Optional[int] = None):
+    client = get_pinecone_client()
+    expected_dimension = dimension or get_embedding_dimension()
+    existing_names = _index_names(client.list_indexes())
+
+    if INDEX_NAME not in existing_names:
+        logger.info(
+            "Creating Pinecone index %s with dimension=%s deploy_type=%s",
+            INDEX_NAME,
+            expected_dimension,
+            DEPLOY_TYPE,
+        )
         try:
-            emb = future.result(timeout=timeout_sec)
-            if not isinstance(emb, list):
-                raise ValueError("Embedding not a list")
-            dim = len(emb)
-            logger.info("Detected Gemini embedding dimension: %s", dim)
-            return dim
-        except TimeoutError:
-            logger.warning(
-                "Timeout while detecting embedding dimension; falling back to default=%s", default
-            )
-        except Exception as e:
-            logger.warning(
-                "Error detecting embedding dimension (%s); falling back to default=%s", e, default
-            )
-    return default
-
-
-# Dynamically determine dimension (non-blocking-ish with timeout)
-DIMENSION = _detect_embedding_dimension()
-
-# Ensure index exists with correct dimension
-def _ensure_index():
-    existing = pc.list_indexes()
-    if INDEX_NAME in existing:
-        existing_dim = None
-        try:
-            desc = pc.describe_index(INDEX_NAME)
-            existing_dim = desc.get("dimension")
-        except Exception:
-            logger.warning("Could not get existing index description for %s", INDEX_NAME)
-
-        if existing_dim != DIMENSION:
-            logger.warning(
-                "Index '%s' has dimension %s (expected %s), deleting and recreating...",
-                INDEX_NAME,
-                existing_dim,
-                DIMENSION,
-            )
-            try:
-                pc.delete_index(INDEX_NAME)
-                _wait_for_index_deletion(INDEX_NAME)
-            except Exception as e:
-                logger.warning("Error deleting index %s: %s", INDEX_NAME, e)
-
-            try:
-                pc.create_index(
-                    name=INDEX_NAME,
-                    dimension=DIMENSION,
-                    metric="cosine",
-                    spec=_make_spec(),
-                )
-                logger.info("Recreated index %s with correct dimension %s", INDEX_NAME, DIMENSION)
-            except PineconeApiException as e:
-                if getattr(e, "status", None) == 409:
-                    logger.info("Index recreate race: already exists, continuing.")
-                else:
-                    raise
-        else:
-            logger.info("✅ Using existing index: %s (dimension=%s)", INDEX_NAME, existing_dim)
-    else:
-        logger.info("📦 Creating vector index: %s (type=%s, dimension=%s)", INDEX_NAME, DEPLOY_TYPE, DIMENSION)
-        try:
-            pc.create_index(
+            client.create_index(
                 name=INDEX_NAME,
-                dimension=DIMENSION,
+                dimension=expected_dimension,
                 metric="cosine",
                 spec=_make_spec(),
             )
-        except PineconeApiException as e:
-            if getattr(e, "status", None) == 409:
-                logger.info("Creation race: index already exists, continuing.")
-            else:
+        except Exception as exc:
+            if getattr(exc, "status", None) != 409:
                 raise
+            logger.info("Pinecone index %s already exists after create race", INDEX_NAME)
+    else:
+        existing_dimension = _describe_dimension(client, INDEX_NAME)
+        if existing_dimension and existing_dimension != expected_dimension:
+            raise RuntimeError(
+                f"Pinecone index '{INDEX_NAME}' has dimension {existing_dimension}, "
+                f"but embeddings are dimension {expected_dimension}. Create a compatible "
+                "index or update PINECONE_INDEX_NAME."
+            )
+        logger.info("Using Pinecone index %s", INDEX_NAME)
+
+    return get_index()
 
 
-# Bootstrap index
-_ensure_index()
-index = pc.Index(INDEX_NAME)
+def get_index():
+    global _index
+    if _index is None:
+        _index = get_pinecone_client().Index(INDEX_NAME)
+    return _index
 
 
 def generate_source_id(document_url: str) -> str:
     return hashlib.md5(document_url.encode("utf-8")).hexdigest()
 
 
+def _namespace_vector_count(namespace: str) -> int:
+    try:
+        stats = get_index().describe_index_stats()
+        namespaces = getattr(stats, "namespaces", None)
+        if namespaces is None and isinstance(stats, dict):
+            namespaces = stats.get("namespaces", {})
+        namespace_stats = (namespaces or {}).get(namespace, {})
+        if isinstance(namespace_stats, dict):
+            return int(namespace_stats.get("vector_count", 0))
+        return int(getattr(namespace_stats, "vector_count", 0))
+    except Exception as exc:
+        logger.warning("Unable to read Pinecone stats for namespace=%s: %s", namespace, exc)
+        return 0
+
+
+def document_already_ingested(source_id: str) -> bool:
+    return _namespace_vector_count(source_id) > 0
+
+
 def store_embeddings_for_text(text: str, source_id: str) -> int:
-    """
-    Embed and upsert a document's text into a namespace (source_id).
-    Returns number of vectors upserted.
-    """
     chunks = chunk_text(text)
     total = 0
+
     for i in range(0, len(chunks), BATCH_SIZE):
         batch_chunks = chunks[i : i + BATCH_SIZE]
         vectors = []
@@ -152,59 +164,65 @@ def store_embeddings_for_text(text: str, source_id: str) -> int:
             cleaned = chunk.strip()
             if not cleaned:
                 continue
-            vector_id = f"{j:06d}"
+
             embedding = get_embedding(cleaned)
-            if not isinstance(embedding, list):
-                logger.warning("Embedding for chunk %s not a list; skipping", j)
+            if not isinstance(embedding, list) or not embedding:
+                logger.warning("Embedding for chunk %s is invalid; skipping", j)
                 continue
-            if len(embedding) != DIMENSION:
-                logger.warning(
-                    "Embedding dim %s mismatches expected %s for chunk %s; skipping",
-                    len(embedding),
-                    DIMENSION,
-                    j,
-                )
-                continue
-            vectors.append({
-                "id": vector_id,
-                "values": embedding,
-                "metadata": {
-                    "text": cleaned if len(cleaned) <= 2000 else cleaned[:2000],
-                    "chunk_index": j,
-                    "source": source_id,
+
+            ensure_index(dimension=len(embedding))
+            vectors.append(
+                {
+                    "id": f"{j:06d}",
+                    "values": embedding,
+                    "metadata": {
+                        "text": cleaned if len(cleaned) <= 2000 else cleaned[:2000],
+                        "chunk_index": j,
+                        "source": source_id,
+                    },
                 }
-            })
+            )
+
         if not vectors:
             continue
+
         for attempt in range(1, 4):
             try:
-                index.upsert(vectors=vectors, namespace=source_id)
+                get_index().upsert(vectors=vectors, namespace=source_id)
                 break
-            except Exception as e:
+            except Exception as exc:
                 backoff = 2 ** (attempt - 1)
                 logger.warning(
-                    "Upsert attempt %s failed for namespace=%s: %s. Retrying in %s sec.",
+                    "Pinecone upsert attempt %s failed for namespace=%s; retrying in %s sec: %s",
                     attempt,
                     source_id,
-                    e,
                     backoff,
+                    exc,
                 )
                 time.sleep(backoff)
         else:
-            raise RuntimeError(f"Failed to upsert into Pinecone namespace={source_id}")
+            raise RuntimeError(f"Failed to upsert vectors into namespace={source_id}")
+
         total += len(vectors)
-    logger.info("✅ Stored %d embeddings under namespace=%s", total, source_id)
+
+    logger.info("Stored %d embedding vector(s) under namespace=%s", total, source_id)
     return total
 
 
-def ingest_document(document_url: str) -> str:
-    """
-    Extract text, embed, and upsert a document by URL.
-    Returns the source_id / namespace.
-    """
+def ingest_document(document_url: str, force: bool = False) -> str:
     source_id = generate_source_id(document_url)
+
+    if not force:
+        try:
+            if document_already_ingested(source_id):
+                logger.info("Document already ingested; skipping re-embedding namespace=%s", source_id)
+                return source_id
+        except Exception as exc:
+            logger.warning("Could not verify ingestion cache for namespace=%s: %s", source_id, exc)
+
     text = extract_text(document_url)
     if not text or not text.strip():
         raise ValueError("No extractable text found in the document.")
+
     store_embeddings_for_text(text, source_id=source_id)
     return source_id

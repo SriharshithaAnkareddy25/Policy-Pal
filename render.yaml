@@ -13,6 +13,8 @@ services:
         sync: false
       - key: GEMINI_EMBD_KEY
         sync: false
+      - key: GEMINI_API_KEY
+        sync: false
     instanceCount: 1
     instanceType: starter
-    # healthCheckPath: /health
+    healthCheckPath: /health

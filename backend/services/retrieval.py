@@ -1,6 +1,6 @@
 from typing import List, Dict, Optional
 from backend.services.embedding import get_embedding
-from backend.services.pinecone_store import index
+from backend.services.pinecone_store import get_index
 
 def semantic_search(
     question: str,
@@ -17,7 +17,7 @@ def semantic_search(
     q_vec = get_embedding(question)
 
     # 2) Query Pinecone
-    res = index.query(
+    res = get_index().query(
         vector=q_vec,
         top_k=top_k,
         include_metadata=True,
